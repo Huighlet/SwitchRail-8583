@@ -204,7 +204,81 @@ print(f"Wire Payload ({len(wire_bytes)} bytes): {wire_bytes.hex()[:32]}...")
 
 ---
 
-## 7. CLI Usage
+## 7. Turnkey REST Gateway & Docker Deployment
+
+SwitchRail-8583 provides dual-mode execution:
+1. **Raw TCP Socket Switch Daemon** (`switchrail server --port 8583`) for ATM/POS ISO 8583 length-prefixed frames.
+2. **FastAPI REST Gateway & Simulator UI** (`switchrail serve --port 8584`) for JSON fintech microservices, automated testing, and Swagger docs.
+
+### 1. Launch Servers via CLI
+
+```bash
+# Launch REST API gateway and developer UI on port 8584
+switchrail serve --host 0.0.0.0 --port 8584
+
+# In a separate terminal, launch the raw TCP socket daemon on port 8583
+switchrail server --host 0.0.0.0 --port 8583
+```
+
+Once running:
+- **Interactive Switch Dashboard:** [`http://localhost:8584/`](http://localhost:8584/)
+- **Interactive Swagger / OpenAPI:** [`http://localhost:8584/docs`](http://localhost:8584/docs)
+- **Switch Engine Health & Telemetry:** [`http://localhost:8584/health`](http://localhost:8584/health)
+- **Active Card BIN Routes:** [`http://localhost:8584/v1/routes`](http://localhost:8584/v1/routes)
+
+### 2. Standalone Container Execution (Docker)
+
+```bash
+# Build production image
+docker build -t switchrail-8583:latest .
+
+# Run container exposing both TCP (8583) and REST (8584) ports
+docker run -d --name switchrail-daemon -p 8583:8583 -p 8584:8584 switchrail-8583:latest
+
+# Verify health status
+curl -s http://localhost:8584/health
+```
+
+### 3. REST API Usage Examples
+
+**Execute 0200 Purchase (Card Transaction):**
+```bash
+curl -X POST http://localhost:8584/v1/switch/transact \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mti": "0200",
+    "pan": "4143450000001234",
+    "amount_minor": 50000,
+    "currency_code": "936"
+  }'
+```
+
+**Execute 0420 Reversal Advice (with DE 90 Audit Trail):**
+```bash
+curl -X POST http://localhost:8584/v1/switch/reversal \
+  -H "Content-Type: application/json" \
+  -d '{
+    "original_mti": "0200",
+    "original_stan": "000123",
+    "original_rrn": "261024000123",
+    "pan": "4143450000001234",
+    "amount_minor": 50000,
+    "currency_code": "936"
+  }'
+```
+
+**Unpack Raw ISO 8583 Wire Hex Frame:**
+```bash
+curl -X POST http://localhost:8584/v1/iso8583/unpack \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hex_wire": "003e3032303070200000008000003136343134333435313233343536373839303030303030303030303030303032353030303030303132335445524d5f303031"
+  }'
+```
+
+---
+
+## 8. CLI Usage
 
 ### 1. Hex Inspection and Dump
 
@@ -242,15 +316,15 @@ switchrail server --host 127.0.0.1 --port 8583
 
 ---
 
-## 8. Test Suite Execution
+## 9. Test Suite Execution
 
-Run the complete 21-case test suite covering bitmask expansion, variable-length field prefixing, PAN shielding, and timeout reversal queues:
+Run the complete 27-case test suite covering bitmask expansion, variable-length field prefixing, PAN shielding, timeout reversal queues, and REST API endpoints:
 
 ```bash
 pytest -v
 ```
 
-All 21 test scenarios pass deterministically:
+All 27 test scenarios pass deterministically:
 ```text
 tests/test_bitmap.py::test_primary_bitmap_binary PASSED
 tests/test_bitmap.py::test_secondary_bitmap_binary_expansion PASSED
@@ -273,10 +347,16 @@ tests/test_saf_and_switch.py::test_switch_handles_0800_echo PASSED
 tests/test_saf_and_switch.py::test_switch_handles_0200_successful_dispatch PASSED
 tests/test_saf_and_switch.py::test_switch_triggers_saf_reversal_on_timeout PASSED
 tests/test_saf_and_switch.py::test_saf_exponential_backoff_and_acknowledgement PASSED
+tests/test_server.py::test_health_check PASSED
+tests/test_server.py::test_dashboard_ui PASSED
+tests/test_server.py::test_routes_endpoints PASSED
+tests/test_server.py::test_transact_purchase_success PASSED
+tests/test_server.py::test_reversal_advice PASSED
+tests/test_server.py::test_unpack_hex_wire PASSED
 ```
 
 ---
 
-## 9. License
+## 10. License
 
 MIT License. Copyright (c) 2026 Huighlet Eyram Zowonu.

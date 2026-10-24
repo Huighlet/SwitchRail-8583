@@ -140,13 +140,21 @@ def main() -> None:
     bench_p = subparsers.add_parser("bench", help="Run packing/unpacking micro-benchmarks")
     bench_p.add_argument("-n", "--count", type=int, default=30000, help="Number of messages")
 
-    # Server
+    # TCP Socket Server
     server_p = subparsers.add_parser("server", help="Launch TCP mock ISO 8583 switch daemon")
     server_p.add_argument("--host", default="127.0.0.1", help="Bind IP")
     server_p.add_argument("--port", type=int, default=8583, help="Bind Port")
 
+    # REST Gateway Server
+    serve_p = subparsers.add_parser("serve", help="Launch FastAPI ISO 8583 REST Gateway service")
+    serve_p.add_argument("--host", default="0.0.0.0", help="Binding host address")
+    serve_p.add_argument("--port", type=int, default=8584, help="Binding port (default: 8584)")
+
     args = parser.parse_args()
-    if args.command == "inspect":
+    if args.command == "serve":
+        from switchrail.server import serve
+        serve(host=args.host, port=args.port)
+    elif args.command == "inspect":
         cmd_unpack_hex(args.hex)
     elif args.command == "bench":
         cmd_bench(args.count)
