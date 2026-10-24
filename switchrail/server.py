@@ -6,13 +6,15 @@ Provides ISO 8583:1987 message encoding/decoding, Longest Prefix Match (LPM) BIN
 
 from __future__ import annotations
 
+import os
 import struct
+import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from switchrail.message import ISO8583Message
@@ -77,6 +79,96 @@ routing_table.default_route = RouteEntry("DEFAULT", "GHIPSS_NATIONAL_SWITCH", "1
 
 saf_queue = StoreAndForwardQueue()
 engine = SwitchEngine(routing_table=routing_table, saf_queue=saf_queue)
+
+_settlement_journal: List[Dict[str, Any]] = []
+_journal_lock = threading.Lock()
+
+
+class SwitchRateLimiter:
+    """Token bucket rate limiter for switch gateway protection."""
+    def __init__(self, capacity: int = 1000, refill_rate: float = 200.0) -> None:
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.refill_rate = refill_rate
+        self.last_ts = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self) -> Tuple[bool, int]:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_ts
+            self.last_ts = now
+            self.tokens = min(float(self.capacity), self.tokens + elapsed * self.refill_rate)
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True, int(self.tokens)
+            return False, 0
+
+
+_limiter = SwitchRateLimiter(capacity=1000, refill_rate=200.0)
+
+
+@app.middleware("http")
+async def enterprise_middleware(request: Request, call_next):
+    allowed, remaining = _limiter.consume()
+    if not allowed:
+        return Response(
+            content='{"detail": "Rate limit exceeded. Switch overloaded."}',
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            media_type="application/json",
+            headers={"Retry-After": "1"},
+        )
+
+    configured_key = os.environ.get("SWITCHRAIL_API_KEY")
+    if configured_key and request.url.path.startswith("/v1/"):
+        req_key = request.headers.get("X-API-Key")
+        if req_key != configured_key:
+            return Response(
+                content='{"detail": "Unauthorized: Invalid or missing X-API-Key header"}',
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                media_type="application/json",
+            )
+
+    response = await call_next(request)
+    response.headers["X-RateLimit-Remaining"] = str(remaining)
+    return response
+
+
+@app.get("/metrics", response_class=PlainTextResponse, tags=["Observability"])
+def get_metrics() -> PlainTextResponse:
+    """Expose Prometheus metrics for switch traffic and queue depth."""
+    with _journal_lock:
+        total_tx = len(_settlement_journal)
+        approved = sum(1 for r in _settlement_journal if r["status"] == "APPROVED")
+        reversed_cnt = sum(1 for r in _settlement_journal if r["status"] == "REVERSED")
+        total_vol = sum(r["amount_minor"] for r in _settlement_journal)
+
+    with saf_queue._lock:
+        saf_depth = len(saf_queue._queue)
+
+    routes_count = len(routing_table._routes)
+
+    lines = [
+        "# HELP switchrail_transactions_total Total financial switch transactions processed",
+        "# TYPE switchrail_transactions_total counter",
+        f"switchrail_transactions_total {total_tx}",
+        "# HELP switchrail_approved_total Total approved purchases",
+        "# TYPE switchrail_approved_total counter",
+        f"switchrail_approved_total {approved}",
+        "# HELP switchrail_reversals_total Total 0420 reversals processed",
+        "# TYPE switchrail_reversals_total counter",
+        f"switchrail_reversals_total {reversed_cnt}",
+        "# HELP switchrail_volume_minor_total Total transactional volume in minor units",
+        "# TYPE switchrail_volume_minor_total counter",
+        f"switchrail_volume_minor_total {total_vol}",
+        "# HELP switchrail_saf_depth Current Store-and-Forward queue depth",
+        "# TYPE switchrail_saf_depth gauge",
+        f"switchrail_saf_depth {saf_depth}",
+        "# HELP switchrail_routes_active Number of active LPM BIN routes",
+        "# TYPE switchrail_routes_active gauge",
+        f"switchrail_routes_active {routes_count}",
+    ]
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------
@@ -266,8 +358,8 @@ def process_transaction(req: TransactRequest):
     iso_msg.set(18, req.mcc)                   # MCC
     iso_msg.set(32, req.pan[:6])               # Acquirer ID (BIN)
     iso_msg.set(37, rrn)                       # RRN
-    iso_msg.set(41, req.terminal_id)           # Terminal ID
-    iso_msg.set(42, req.merchant_id)           # Merchant ID
+    iso_msg.set(41, (req.terminal_id or "TERM0001")[:8]) # Terminal ID (fixed 8 chars)
+    iso_msg.set(42, (req.merchant_id or "MERC00000000001")[:15]) # Merchant ID (fixed 15 chars)
     iso_msg.set(49, req.currency_code)         # Currency
 
     # Match Route
@@ -280,6 +372,20 @@ def process_transaction(req: TransactRequest):
     wire_bytes = resp_msg.pack(include_length_prefix=True)
 
     fields_dict = {str(k): v for k, v in resp_msg.fields.items()}
+
+    with _journal_lock:
+        _settlement_journal.append({
+            "type": "PURCHASE",
+            "mti": req.mti,
+            "institution": route.destination_id,
+            "pan_masked": f"{req.pan[:6]}******{req.pan[-4:]}",
+            "amount_minor": req.amount_minor,
+            "currency_code": req.currency_code,
+            "stan": stan,
+            "rrn": rrn,
+            "status": "APPROVED" if resp_msg.get(39) == ResponseCode.APPROVED.value else "DECLINED",
+            "timestamp_ns": time.time_ns(),
+        })
 
     return {
         "status": "APPROVED" if resp_msg.get(39) == ResponseCode.APPROVED.value else "DECLINED",
@@ -324,6 +430,20 @@ def process_reversal(req: ReversalRequest):
     resp_msg = engine.process_inbound(iso_msg)
     wire_bytes = resp_msg.pack(include_length_prefix=True)
 
+    with _journal_lock:
+        _settlement_journal.append({
+            "type": "REVERSAL",
+            "mti": "0420",
+            "institution": route.destination_id,
+            "pan_masked": f"{req.pan[:6]}******{req.pan[-4:]}",
+            "amount_minor": req.amount_minor,
+            "currency_code": req.currency_code,
+            "stan": stan,
+            "rrn": req.original_rrn,
+            "status": "REVERSED",
+            "timestamp_ns": time.time_ns(),
+        })
+
     return {
         "status": "REVERSED",
         "mti": resp_msg.mti,
@@ -361,6 +481,70 @@ def unpack_hex(req: HexUnpackRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"ISO 8583 unpacking error: {e}")
+
+
+@app.post("/v1/switch/settlement/eod", tags=["Settlement"])
+def export_settlement_eod() -> Dict[str, Any]:
+    """Generate End-of-Day Cutover & Net Interbank Settlement report."""
+    import hashlib
+    with _journal_lock:
+        records = list(_settlement_journal)
+
+    institutions: Dict[str, Dict[str, Any]] = {}
+    total_gross = 0
+    total_reversals = 0
+
+    for r in records:
+        inst = r["institution"]
+        if inst not in institutions:
+            institutions[inst] = {
+                "institution_id": inst,
+                "total_transactions": 0,
+                "approved_count": 0,
+                "reversal_count": 0,
+                "gross_amount_minor": 0,
+                "reversal_amount_minor": 0,
+                "net_settlement_minor": 0,
+            }
+        stats = institutions[inst]
+        stats["total_transactions"] += 1
+        if r["status"] == "APPROVED":
+            stats["approved_count"] += 1
+            stats["gross_amount_minor"] += r["amount_minor"]
+            total_gross += r["amount_minor"]
+        elif r["status"] == "REVERSED":
+            stats["reversal_count"] += 1
+            stats["reversal_amount_minor"] += r["amount_minor"]
+            total_reversals += r["amount_minor"]
+        stats["net_settlement_minor"] = stats["gross_amount_minor"] - stats["reversal_amount_minor"]
+
+    batch_id = f"SETTLE_{time.strftime('%Y%m%d_%H%M%S')}"
+    payload_str = f"{batch_id}:{total_gross}:{total_reversals}:{len(records)}"
+    batch_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+    return {
+        "status": "SETTLED",
+        "batch_id": batch_id,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total_records_processed": len(records),
+        "total_gross_minor": total_gross,
+        "total_reversals_minor": total_reversals,
+        "net_clearing_volume_minor": total_gross - total_reversals,
+        "clearing_hash": batch_hash,
+        "institutions": list(institutions.values()),
+    }
+
+
+@app.get("/v1/switch/saf/pending", tags=["SAF"])
+def get_saf_pending() -> Dict[str, Any]:
+    """Retrieve pending Store-and-Forward reversals awaiting retry."""
+    with saf_queue._lock:
+        pending = [
+            {"reversal_id": r.reversal_id, "destination": r.destination_id, "retries": r.retry_count}
+            for r in saf_queue._queue.values()
+            if not r.is_settled
+        ]
+    return {"pending_count": len(pending), "queue": pending}
 
 
 def serve(host: str = "0.0.0.0", port: int = 8584):
