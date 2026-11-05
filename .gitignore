@@ -28,3 +28,9 @@ htmlcov/
 *.log
 *.pcap
 bench_output/
+
+# SQLite WAL databases
+*.db
+*.db-wal
+*.db-shm
+

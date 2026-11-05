@@ -1,8 +1,39 @@
 # SwitchRail-8583
 
-High-Performance Financial Protocol Engine, ISO 8583 Parser, and Payment Switch.
+[![Tests](https://img.shields.io/badge/tests-35%20passed-10b981?style=flat-square)](tests/)
+[![ISO 8583](https://img.shields.io/badge/protocol-ISO%208583%3A1987-06b6d4?style=flat-square)](switchrail/)
+[![Storage](https://img.shields.io/badge/persistence-SQLite3%20WAL-3b82f6?style=flat-square)](switchrail/server.py)
+[![License: MIT](https://img.shields.io/badge/license-MIT-64748b?style=flat-square)](LICENSE)
 
-Designed for inter-bank card clearing rails, ATM/POS acquirer networks, and national payment switches (such as GhIPSS in Ghana, NIBSS in Nigeria, and global card schemes). Built from first principles to provide zero-allocation bitmask manipulation, dynamic BIN routing, and Store-and-Forward (SAF) reversal guarantees.
+High-Performance Financial Protocol Engine, ISO 8583 Parser, and National Clearing House Payment Switch.
+
+Designed for inter-bank card clearing rails, ATM/POS acquirer networks, and national payment switches (such as GhIPSS in Ghana, NIBSS in Nigeria, and global card schemes). Built from first principles to provide zero-allocation bitmask manipulation, dynamic Longest-Prefix-Match (LPM) BIN routing, Store-and-Forward (SAF) 0420 reversal guarantees, durable SQLite WAL transaction journaling, and an interactive operator console.
+
+---
+
+## Interactive Operator Console & Visual Verification
+
+SwitchRail-8583 includes a four-tab institutional operator console at `GET /` (`http://localhost:8584/`), continuously verified via automated Playwright end-to-end visual tests (`tests/test_visual_e2e.py`).
+
+### 1. Live ISO 8583 Terminal & POS Simulator (64/128-Bit Binary Bitmap Matrix)
+Interactive acquirer terminal simulator supporting `0100` (Pre-Authorization), `0200` (POS Financial Purchase), and `0800` (Network Echo) frames with 1-click bank BIN presets (`ECOBANK_GH`, `STANBIC_GH`, `GCB_BANK`, and fallback `GHIPSS_NATIONAL_SWITCH`), real-time 64/128-bit active Data Element bitmap matrix highlighting, LPM hop trace, and big-endian wire hex inspection:
+
+![Live ISO 8583 Terminal & POS Simulator](docs/screenshots/switchrail_01_pos_terminal_bitmap.png)
+
+### 2. Wire Frame Hex Dissector (`POST /v1/iso8583/unpack`)
+Bit-level ISO 8583 wire packet dissector that decodes raw length-prefixed big-endian hex streams into MTI classification metadata, primary and extended 128-bit secondary bitmaps (such as `0420` SAF reversals containing `DE 90`), PCI-masked Data Element tables, and structured diagnostic dumps:
+
+![Wire Frame Hex Dissector](docs/screenshots/switchrail_02_hex_frame_dissector.png)
+
+### 3. Dynamic Longest-Prefix-Match (LPM) BIN Routing Table (`POST /v1/routes` & `POST /v1/routes/match`)
+Real-time LPM BIN routing workbench displaying registered institution prefixes, socket endpoints, SLA timeouts, live prefix scan resolution (`8 -> 1` digit evaluation trace), and dynamic BIN route registration:
+
+![LPM BIN Routing Table](docs/screenshots/switchrail_03_lpm_bin_routing.png)
+
+### 4. 0420 Store-and-Forward (SAF) Reversal Queue & Interbank Settlement Journal
+Durable SQLite WAL transaction journal and `0420` SAF reversal queue with 1-click `TRIGGER 0420 REVERSAL` dispatch on cleared `0200` transactions, asynchronous `DRAIN SAF QUEUE` (`POST /v1/switch/saf/drain`) replay, and SHA-256 End-of-Day (EOD) multi-bank net settlement cutover (`POST /v1/switch/settlement/eod`):
+
+![0420 SAF Reversal Queue & Settlement Journal](docs/screenshots/switchrail_04_saf_reversal_journal.png)
 
 ---
 
